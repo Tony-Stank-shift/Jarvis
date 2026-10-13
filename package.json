@@ -1,0 +1,36 @@
+{
+  "name": "dsh-jarvis",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Jarvis — 专属全能生活小助手（DSH 插件）：人格注入 / 个人档案 / 双轨记忆 / 五闸门项目协议 / 红线保险丝 / 每日情报流水线。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib",
+    "skills",
+    "cordis.patch.yml",
+    "README.md",
+    "INSTALL.md"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    }
+  }
+}

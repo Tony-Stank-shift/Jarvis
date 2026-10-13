@@ -1,0 +1,7 @@
+# Bundle patch layer (dsh-jarvis) — mounts the host half.
+# The row loads this package's main entry (`index.js`) as a plain Cordis plugin;
+# that module exports `name`, `inject` and `apply(ctx)`. There is no client half
+# in v0.1, so no `dsh.client` declaration is needed here.
+- insert:
+    - id: jarvis
+      name: 'dsh-jarvis'

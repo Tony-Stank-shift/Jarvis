@@ -23,6 +23,14 @@ import * as memory from './lib/memory.js';
 import * as knowledge from './lib/knowledge.js';
 import * as project from './lib/project.js';
 import * as intel from './lib/intel.js';
+import * as telemetry from './lib/telemetry.js';
+import * as claims from './lib/claims.js';
+import * as palace from './lib/palace.js';
+import { verify as verifyCitations } from './lib/verify.js';
+import { contextReality } from './lib/context.js';
+import { resolveWorkspace, normalizeWorkspace } from './lib/workspace.js';
+import * as review from './lib/review.js';
+import { buildCases, runEval, renderReport } from './lib/eval.js';
 import { probe as preflightProbe } from './lib/preflight.js';
 
 export const name = 'jarvis';
@@ -40,6 +48,27 @@ const RUNTIME_SKILLS = [
   { name: 'jarvis-project', description: '五闸门项目协议：题意还原→知识盘点→差距补课→方案与创新度→执行（含小项自检、第三方检查、汇报卡）' },
   { name: 'jarvis-review', description: '第三方检查官：以独立、对抗性的立场复核 Jarvis 自己的产出，默认找茬，必须给出可复现的判据' },
   { name: 'jarvis-intel', description: '每日情报与周报：AI/AI4S/具身智能 的抓取、排序、沉淀，以及挂钩四条战线的周复盘' },
+];
+
+/**
+ * 计划注册的工具名清单。
+ *
+ * 存在理由是一条实战教训：之前启动日志里硬编码 `tools=N/9`，结果改名/新增工具后
+ * 数字对不上，反而误导排查（第 9 行代码旁边就写着"绝不再写死数字"，然后违反了）。
+ * 现在改成"计划清单 vs 实际注册"做差集，少一个就点名。
+ */
+const PLANNED_TOOLS = [
+  'jarvis_status',
+  'jarvis_mode',
+  'jarvis_profile',
+  'jarvis_memory',
+  'jarvis_project',
+  'jarvis_knowledge',
+  'jarvis_preflight',
+  'jarvis_intel',
+  'jarvis_weekly',
+  'jarvis_verify',
+  'jarvis_correction',
 ];
 
 // ---------------------------------------------------------------------------
@@ -125,13 +154,24 @@ export function apply(ctx, config = {}) {
   try {
     ensureDir(paths.home);
     const boot = { profile: ensureProfile(), rules: ensureRules() };
-    logLine(`jarvis v0.1 apply(); home=${paths.home}; profileCreated=${boot.profile.created}`);
+    logLine(`jarvis v0.3.0 apply(); home=${paths.home}; profileCreated=${boot.profile.created}`);
   } catch (e) {
     try {
       ctx.logger?.warn?.(`[jarvis] 初始化数据目录失败：${e?.message ?? e}`);
     } catch {
       /* ignore */
     }
+  }
+
+  // 补跑检查（2.2）：每次启动看一眼今天的情报抓没抓。
+  // 只报告、不自动抓——抓外网要过红线闸门，不能在这里偷偷跑。
+  try {
+    const cu = intel.catchUpState();
+    if (cu.due) {
+      logLine(`[catchup] 今日 ${cu.today} 情报缺失；lastDate=${cu.lastDate ?? '从未'}；gapDays=${cu.gapDays ?? 'n/a'}`);
+    }
+  } catch {
+    /* ignore */
   }
 
   // warn/info 一律**同时**写 jarvis.log。教训：只写 ctx.logger 时，注册失败之类
@@ -205,6 +245,10 @@ export function apply(ctx, config = {}) {
       if (!intelToday) gaps.push('今天还没有情报日报 → 跑 jarvis_intel');
       if (projects.length === 0) gaps.push('没有进行中的项目 → 用户给任务时用 jarvis_project(action="open") 立项');
       if (ms.facts === 0) gaps.push('事实记忆为空 → 对话中了解到的稳定事实用 jarvis_memory 记住');
+      const tele = telemetry.summarize({ days: 14 });
+      const corr = claims.stats();
+      const catchUp = intel.catchUpState();
+      const ctxInfo = contextReality();
       return {
         ok: true,
         mode: cfg.mode,
@@ -217,11 +261,18 @@ export function apply(ctx, config = {}) {
         knowledge: ks,
         projects,
         deadlines: intel.countdown(),
+        telemetry: tele,
+        corrections: corr,
+        catchUp,
+        context: ctxInfo,
         gaps,
         message:
           `模式：${MODE_LABELS[cfg.mode] ?? cfg.mode}｜记忆 ${ms.facts} 事实 / ${ms.episodes} 情节｜` +
           `知识库 ${ks.notes} 笔记 + ${ks.intelDays} 天情报｜进行中项目 ${projects.length}｜` +
-          `最近情报 ${ks.lastIntelDate ?? '无'}`,
+          `最近情报 ${ks.lastIntelDate ?? '无'}\n` +
+          `埋点：${tele.verdict}\n` +
+          `纠错账本：${corr.note}\n` +
+          `压缩实况：${ctxInfo.note}`,
       };
     }),
   });
@@ -303,13 +354,36 @@ export function apply(ctx, config = {}) {
   register({
     name: 'jarvis_memory',
     description:
-      '双轨长期记忆。kind=fact 存稳定事实（性格、习惯、偏好、长期约束、已掌握的知识点）；kind=episode 存情节（某天发生了什么、某次对话的结论、情绪状态）。action=remember 写入；action=recall 按关键词+时间衰减检索（事实衰减轻、情节衰减快）；action=list 按时间倒序列出；action=forget 删除；action=stats 统计。写入只发生在 ~/.dsh/jarvis/ 内，无需审批。',
+      '双轨长期记忆 + 记忆宫殿。kind=fact 存稳定事实；kind=episode 存情节。每条记忆归入一个**房间**并按 loci 顺序占一个**位置**，并带强度模型（strength/stability/due）。action：remember 写入（可指定 room）；recall 三阶段检索（选房间 → 房间内 → 串门一跳 → 全局兜底）；list 列出；rooms 看房间清单；organize 迁移旧记录+重建 ROOM.md/INDEX.md+顺带冷归档（支持 room+doorplate 写门牌）；review 看到期该确认的记忆；reinforce/weaken 加固或削弱（**这就是遗忘曲线的施力点**）；move 迁房；archive 冷归档；cold 看冷档；restore 从冷档捞回；forget 彻底删除；stats 统计。冷归档是移动不是删除。写入只发生在 ~/.dsh/jarvis/ 内，无需审批。',
     parameters: schema(
       {
-        action: { type: 'string', enum: ['remember', 'recall', 'list', 'forget', 'stats'], description: '要做什么' },
+        action: {
+          type: 'string',
+          enum: ['remember', 'recall', 'list', 'rooms', 'organize', 'review', 'reinforce', 'weaken', 'move', 'archive', 'cold', 'restore', 'forget', 'stats', 'eval'],
+          description: '要做什么',
+        },
         kind: { type: 'string', enum: ['fact', 'episode', 'all'], description: '记忆轨道；默认 fact（remember 时）/' + 'all（检索时）' },
         text: { type: 'string', description: 'remember 时的记忆正文' },
         tags: { type: 'array', items: { type: 'string' }, description: '标签，便于分类检索' },
+        room: {
+          type: 'string',
+          description:
+            '房间。recall 时＝**硬过滤**（只在这个房间里搜，不走门、不做全局兜底——所以可能返回空）；remember/move/organize(doorplate) 时＝目标房间。可用 A-课内 / B-科研 / D-AI全栈 / 升学 / 人 / 规则 / inbox，或 `项目-<项目名>`（简写「课内」「科研」「AI全栈」也认）。不给就自动归房。给了但不认识会报错并列可选项——不猜。',
+        },
+        loci: { type: 'number', description: 'remember 时房间内的位置序号；不给就排在队尾' },
+        workspace: {
+          type: 'string',
+          description:
+            '工作区路径。remember 时不给则自动取当前会话目录（失败则为未标注）；recall/list 时**只有给了才会过滤**——默认不过滤，因为在 A 目录问 B 目录的事不该变哑巴。',
+        },
+        ids: { type: 'array', items: { type: 'string' }, description: 'move / reinforce / weaken / restore 时的记录 id 列表' },
+        assignments: {
+          type: 'object',
+          additionalProperties: { type: 'string' },
+          description: 'organize 时：`{ "记录id": "房间名" }`。没给的旧记录进 inbox（不猜）。',
+        },
+        doorplate: { type: 'string', description: 'organize 时（需同时给 room）：房门的一句话描述，写进 room.json 并渲染到 ROOM.md', },
+        dryRun: { type: 'boolean', description: 'organize/archive 时：只报告会归档哪些，不实际移动' },
         query: { type: 'string', description: 'recall/forget 的检索词' },
         id: { type: 'string', description: 'forget 时按 id 精确删除' },
         source: { type: 'string', description: '来源标记（默认 conversation）' },
@@ -319,11 +393,116 @@ export function apply(ctx, config = {}) {
       ['action'],
     ),
     output: { schema: TEXT_OUT({}) },
-    timeoutMs: 15_000,
+    timeoutMs: 30_000,
     isConcurrencySafe: () => false,
-    execute: safe(async (args) => {
+    execute: safe(async (args, exec) => {
+      const t0 = Date.now();
       const action = String(args.action ?? 'recall');
+      // 当前工作区。resolveWorkspace 永不抛错，最差返回 source:'unknown'。
+      // 它只用于**标注**；过滤必须显式给 workspace 参数才生效（v0.3 · 3.2b）。
+      const ws = await resolveWorkspace(ctx, exec);
+      const wsExplicit = normalizeWorkspace(args.workspace);
       const kind = ['fact', 'episode', 'all'].includes(args.kind) ? args.kind : action === 'remember' ? 'fact' : 'all';
+      if (action === 'rooms') {
+        const r = palace.listRooms();
+        const empty = r.rooms.filter((x) => x.facts + x.episodes === 0).map((x) => x.slug);
+        return {
+          ok: true,
+          ...r,
+          emptyRooms: empty,
+          indexFile: join(paths.palaceDir, 'INDEX.md'),
+          message:
+            `共 ${r.rooms.length} 个房间。` +
+            (r.legacyCount > 0 ? `**有 ${r.legacyCount} 条旧记录还没归房**，跑 action="organize" 迁移。` : '') +
+            (empty.length ? `\n空房间（0 条）：${empty.join(' / ')}——空着不建目录，只在 INDEX.md 里记 0 条。` : ''),
+        };
+      }
+      if (action === 'organize') {
+        // 顺序很重要：门牌必须**先**写，再重建视图。
+        // 第一版顺序反了，结果 room.json 写对了、ROOM.md 里却还是「未填写」——
+        // 视图是派生的，它只能反映"写之前"的磁盘状态。
+        if (args.room && typeof args.doorplate === 'string') {
+          palace.setDoorplate({ room: args.room, doorplate: args.doorplate });
+        }
+        const r = palace.organize({ assignments: args.assignments ?? {} });
+        const cold = memory.archiveCold({ dryRun: args.dryRun === true });
+        return {
+          ok: true,
+          indexFile: r.indexFile,
+          written: r.written,
+          rooms: r.rooms,
+          migrated: r.migrated,
+          cold,
+          message:
+            `已重建 ${r.written.length} 个房间视图 + INDEX.md：${r.indexFile}\n` +
+            `迁移旧记录 ${r.migrated.migrated} 条（显式指派 ${r.migrated.assigned}，进 inbox ${r.migrated.toInbox}）。\n` +
+            `冷归档 ${cold.archived} 条${cold.dryRun ? '（dryRun，未移动）' : ''}` +
+            (cold.archived > 0 && !cold.dryRun ? `，已移入 ${cold.file}（可 restore 捞回）` : '') +
+            (r.migrated.toInbox > 0
+              ? '\n\n进 inbox 的那几条**刻意没猜**——房间分错的记忆在房间视图里是隐形的。看完清单用 action="move" 归位。'
+              : ''),
+        };
+      }
+      if (action === 'review') {
+        const rows = memory.dueList({ limit: args.limit ?? 10 });
+        return {
+          ok: true,
+          count: rows.length,
+          results: rows,
+          message:
+            rows.length === 0
+              ? '没有到期的记忆。这不等于"记忆都没问题"，只说明按当前 stability 还没有一条走到 due。'
+              : `${rows.length} 条到期待确认（按到期先后排）。对每条问一句"现在还成立吗"：成立 → reinforce；不成立 → weaken。**别跳过**，跳过等于让它按旧强度继续影响判断。`,
+        };
+      }
+      if (action === 'reinforce' || action === 'weaken') {
+        const changed = action === 'reinforce' ? memory.reinforce({ ids: args.ids ?? [] }) : memory.weaken({ ids: args.ids ?? [] });
+        if (changed.length > 0) palace.rebuildViews();
+        return {
+          ok: true,
+          changed,
+          message:
+            changed.length === 0
+              ? '没有匹配的 id（可能已归档）。'
+              : `${action === 'reinforce' ? '加固' : '削弱'} ${changed.length} 条。` +
+                changed.map((c) => `\n- ${c.id}｜强度 ${c.strength}｜稳定度 ${c.stability} 天｜下次到期 ${String(c.due).slice(0, 10)}`).join(''),
+        };
+      }
+      if (action === 'archive') {
+        const r = memory.archiveCold({ dryRun: args.dryRun === true });
+        if (r.archived > 0 && !r.dryRun) palace.rebuildViews();
+        return {
+          ok: true,
+          ...r,
+          message:
+            r.archived === 0
+              ? `没有需要冷归档的条目（判据：可回想概率 < ${memory.COLD_THRESHOLD} 且年龄 > 一个 stability）。`
+              : `${r.dryRun ? '（dryRun）' : ''}冷归档 ${r.archived} 条 → ${r.file}。这是**移动不是删除**，restore 可捞回。`,
+        };
+      }
+      if (action === 'cold') {
+        const rows = memory.coldList({ limit: args.limit ?? 20 });
+        return {
+          ok: true,
+          count: rows.length,
+          results: rows,
+          message: rows.length === 0 ? '冷档是空的。' : `冷档 ${rows.length} 条。捞回用 action="restore" + ids。`,
+        };
+      }
+      if (action === 'restore') {
+        const r = memory.restoreCold({ ids: args.ids ?? [] });
+        if (r.restored > 0) palace.rebuildViews();
+        return {
+          ok: true,
+          ...r,
+          message: r.restored > 0 ? `已捞回 ${r.restored} 条（强度重置 0.4，7 天后到期）。` : r.note ?? '没有捞回任何条目。',
+        };
+      }
+      if (action === 'move') {
+        const r = memory.move({ ids: args.ids ?? [], room: args.room, kind });
+        palace.rebuildViews();
+        return { ok: true, ...r, message: `已迁移 ${r.moved} 条到「${r.room}」，视图已重建。` };
+      }
       if (action === 'remember') {
         const rec = memory.remember({
           kind: kind === 'all' ? 'fact' : kind,
@@ -331,26 +510,99 @@ export function apply(ctx, config = {}) {
           tags: args.tags,
           source: args.source ?? 'conversation',
           confidence: args.confidence,
+          room: args.room ?? null,
+          loci: args.loci ?? null,
+          workspace: wsExplicit ?? ws.path,
         });
-        return { ok: true, record: rec, stats: memory.stats(), message: `已记住（${rec.kind}）：${rec.text.slice(0, 80)}${rec.text.length > 80 ? '…' : ''}` };
+        palace.rebuildViews();
+        return {
+          ok: true,
+          record: rec,
+          stats: memory.stats(),
+          message:
+            `已记住（${rec.kind}｜房间 \`${rec.room}\` 位置 ${rec.loci}${rec.routed === 'auto' ? '｜自动归房' : '｜指定房间'}｜工作区 ${rec.workspace ?? '未标注'}）：` +
+            `${rec.text.slice(0, 80)}${rec.text.length > 80 ? '…' : ''}`,
+        };
       }
       if (action === 'recall') {
-        const rows = memory.recall({ query: args.query ?? '', kind, limit: args.limit ?? 8, tags: args.tags });
+        const candidates = memory.countAll(kind);
+        const rows = memory.recall({ query: args.query ?? '', kind, limit: args.limit ?? 8, tags: args.tags, room: args.room ?? null, workspace: wsExplicit });
+        const meta = rows.meta ?? {};
+        telemetry.logMemory({
+          action,
+          kind,
+          query: args.query ?? '',
+          candidates,
+          returned: rows.length,
+          topScore: rows[0]?.score ?? null,
+          latencyMs: Date.now() - t0,
+          storeSize: candidates,
+          extra: {
+            stage: meta.stage ?? null,
+            roomsUsed: meta.roomsUsed ?? [],
+            doors: (meta.doorsUsed ?? []).length,
+            fallback: meta.fallback ?? 0,
+          },
+        });
         return {
           ok: true,
           count: rows.length,
+          stage: meta.stage ?? null,
+          roomsUsed: meta.roomsUsed ?? [],
+          doorsUsed: meta.doorsUsed ?? [],
+          fallback: meta.fallback ?? 0,
+          currentWorkspace: ws,
+          workspaceFilter: wsExplicit,
           results: rows,
-          message: rows.length === 0 ? '记忆里没有相关条目。' : `找到 ${rows.length} 条相关记忆。`,
+          message:
+            rows.length === 0
+              ? meta.stage === 'room'
+                ? `房间 ${(meta.roomsUsed ?? []).join(' / ')} 里没有匹配的条目。这是**硬过滤**的结果——换成不指定 room 再搜一次，别房间或全局可能就有。`
+                : '记忆里没有相关条目。'
+              : `找到 ${rows.length} 条相关记忆` +
+                (meta.stage === 'room'
+                  ? `（限定在房间 ${meta.roomsUsed.join(' / ')} 内，不走门、不做全局兜底）`
+                  : meta.stage === 'palace'
+                    ? `（走了房间 ${meta.roomsUsed.join(' / ')}${
+                        (meta.doorsUsed ?? []).length ? `，串门 ${meta.doorsUsed.map((d) => `${d.from}→${d.to}`).join('、')}` : ''
+                      }，全局兜底补 ${meta.fallback} 条）`
+                    : meta.stage === 'strength'
+                      ? '（按可回想强度兜底：没命中关键词，端上最鲜活的）'
+                      : '（没命中任何房间关键词，走全局检索）') +
+                '。',
         };
       }
       if (action === 'list') {
-        const rows = memory.list({ kind, limit: args.limit ?? 50 });
+        const rows = memory.list({ kind, limit: args.limit ?? 50, workspace: wsExplicit });
+        telemetry.logMemory({ action, kind, candidates: rows.length, returned: rows.length, latencyMs: Date.now() - t0 });
         return { ok: true, count: rows.length, results: rows, message: `共 ${rows.length} 条。` };
       }
       if (action === 'forget') {
         if (!args.id && !args.query) return { ok: false, message: 'forget 需要 id 或 query。' };
         const r = memory.forget({ id: args.id ?? '', query: args.query ?? '', kind });
         return { ok: true, ...r, stats: memory.stats(), message: `已删除 ${r.removed} 条。` };
+      }
+      if (action === 'eval') {
+        // 检索基准（v0.3 · 3.5）：题目从当前真实记忆里生成，所以成绩只对这台机器有意义。
+        const records = memory.list({ kind: 'all', limit: 500 });
+        const { cases, coverage } = buildCases({ records, limit: Math.max(4, Math.min(30, Number(args.limit) || 20)) });
+        const result = runEval({ recall: memory.recall, cases });
+        const report = renderReport(result, { title: `检索基准 · ${localDate()}`, coverage });
+        const file = join(paths.home, 'journal', `eval-${localDate()}.md`);
+        writeText(file, report);
+        return {
+          ok: true,
+          ...result,
+          coverage,
+          file,
+          message:
+            `检索基准：**${result.passed}/${result.total}**（${(result.score * 100).toFixed(1)}%）→ ${file}\n` +
+            `覆盖：${coverage.note}` +
+            (result.failed > 0
+              ? `\n失败 ${result.failed} 条：` + result.details.filter((d) => !d.pass).map((d) => `${d.id}「${d.query}」${d.reasons.join('；')}`).join(' ｜ ')
+              : '') +
+            '\n\n这个分数是 3.4 的验收基线：改检索之后重跑，分数必须上升或不降。',
+        };
       }
       const s = memory.stats();
       return { ok: true, stats: s, message: `事实 ${s.facts} 条 / 情节 ${s.episodes} 条。` };
@@ -366,7 +618,7 @@ export function apply(ctx, config = {}) {
       '五闸门项目协议（R1 的引擎）。action=open 立项（**只建状态、绝不开工**）；action=record 记录某道闸门的产出（不可跳跃；第 3 道闸门要带 consent=true 才算拿到用户同意开工）；action=wbs 设置小项拆分（每项 30–60 分钟 + 验收判据）；action=progress 推进小项（标记 done 必须给 evidence）；action=status 看单个项目；action=list 列全部；action=close 关闭。文档落在 ~/.dsh/jarvis/projects/<slug>/。写入无需审批。',
     parameters: schema(
       {
-        action: { type: 'string', enum: ['open', 'record', 'wbs', 'progress', 'status', 'list', 'close'], description: '要做什么' },
+        action: { type: 'string', enum: ['open', 'record', 'wbs', 'progress', 'status', 'list', 'review', 'close'], description: '要做什么' },
         name: {
           type: 'string',
           description:
@@ -376,6 +628,7 @@ export function apply(ctx, config = {}) {
         deliverable: { type: 'string', description: 'open 时：交付物' },
         deadline: { type: 'string', description: 'open 时：截止时间' },
         stakes: { type: 'string', description: 'open 时：为什么值得做 / 对四条战线的意义' },
+        workspace: { type: 'string', description: 'open 时：工作区路径标注。不给就自动取当前会话目录；取不到就留空（不编默认值）' },
         gate: { type: 'string', description: 'record 时：闸门（1/2/3/4/5，或 restate/inventory/gap/plan/execute，或中文名）' },
         content: { type: 'string', description: 'record 时：该闸门的产出（Markdown）' },
         userKnowledge: { type: 'string', description: 'record 第 2 道闸门时：用户自述已掌握的知识' },
@@ -393,22 +646,42 @@ export function apply(ctx, config = {}) {
         report: { type: 'string', description: 'progress 时：给用户的一句汇报' },
         outcome: { type: 'string', description: 'close 时：结论' },
         followUp: { type: 'string', description: 'close 时：后续可做的事' },
+        target: { type: 'string', description: 'review 时：本次评审的对象（例："小项 1.4 rcs.py + Mie 对比"）' },
+        items: {
+          type: 'array',
+          description: 'review 时：逐条判定。清单没走完 → 判为 incomplete，不算通过。',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'C1…C9' },
+              verdict: { type: 'string', enum: ['pass', 'fail', 'na'] },
+              evidence: { type: 'string', description: '可复现依据：命令+退出码 / 文件:行号 / 返回值片段' },
+            },
+            required: ['id', 'verdict'],
+          },
+        },
+        reproduce: { type: 'array', items: { type: 'string' }, description: 'review 时：复现命令（写进 REVIEW.md）' },
+        artifacts: { type: 'array', items: { type: 'string' }, description: 'review 时：计入指纹的文件绝对路径（sha256 前 16 位）' },
+        summary: { type: 'string', description: 'review 时：总裁决说明' },
       },
       ['action'],
     ),
     output: { schema: TEXT_OUT({ next: { type: 'object' } }) },
     timeoutMs: 20_000,
     isConcurrencySafe: () => false,
-    execute: safe(async (args) => {
+    execute: safe(async (args, exec) => {
       const action = String(args.action ?? 'status');
       switch (action) {
         case 'open': {
+          // 立项时标注工作区（v0.3 · 3.2b）。取不到就留空，不编一个默认路径。
+          const ws = await resolveWorkspace(ctx, exec);
           const r = project.open({
             name: args.name,
             goal: args.goal,
             deadline: args.deadline,
             deliverable: args.deliverable,
             stakes: args.stakes,
+            workspace: String(args.workspace ?? '').trim() || ws.path || '',
           });
           return {
             ok: true,
@@ -452,6 +725,41 @@ export function apply(ctx, config = {}) {
         case 'list': {
           const rows = project.list();
           return { ok: true, projects: rows, count: rows.length, message: rows.length === 0 ? '目前没有项目。' : `共 ${rows.length} 个项目。` };
+        }
+        case 'review': {
+          const checks = review.listChecks();
+          if (!Array.isArray(args.items) || args.items.length === 0) {
+            return {
+              ok: true,
+              checks,
+              message:
+                '评审必须逐条判定，不许跳过。清单如下，把每条填成 pass/fail/na 并给**可复现依据**，\n' +
+                '再用 items:[{id,verdict,evidence}] 传回来。\n\n' +
+                checks.map((c) => `${c.id}. ${c.q}\n    怎么做：${c.how}\n    判不合格：${c.failIf}`).join('\n\n') +
+                '\n\n注意：这不是独立第三方——评审者还是我。抬头会写死这句话，不许含糊。',
+            };
+          }
+          const st = project.status({ name: args.name });
+          const r = review.writeReview({
+            slug: st.slug,
+            name: st.name,
+            target: args.target ?? '',
+            items: args.items,
+            reproduce: Array.isArray(args.reproduce) ? args.reproduce : [],
+            artifacts: Array.isArray(args.artifacts) ? args.artifacts : [],
+            summary: args.summary ?? '',
+          });
+          return {
+            ok: true,
+            verdict: r.overall,
+            ...r,
+            message:
+              `评审已落盘：${r.file}\n**总裁决：${r.overall}**` +
+              (r.fails.length ? `\n不合格：${r.fails.join(' / ')}` : '') +
+              (r.missing.length ? `\n**漏判（清单没走完，不算通过）：${r.missing.join(' / ')}**` : '') +
+              (r.noEvidence.length ? `\n缺依据：${r.noEvidence.join(' / ')}` : '') +
+              (r.overall === 'pass' ? '' : '\n\n总裁决不是 pass → 不许把这个小项标 done。'),
+          };
         }
         case 'close': {
           const r = project.close({ name: args.name, outcome: args.outcome, followUp: args.followUp });
@@ -566,6 +874,7 @@ export function apply(ctx, config = {}) {
       top: { type: 'number', description: '精选条数（默认取配置里的 digestTop，12）' },
       includeHf: { type: 'boolean', description: '是否包含 Hugging Face Daily Papers（默认 true）' },
       timeoutMs: { type: 'number', description: '单个请求超时（毫秒，默认 20000）' },
+      ifMissing: { type: 'boolean', description: '今天已经抓过就跳过（补跑场景用：只在缺的时候抓）' },
     }),
     output: { schema: TEXT_OUT({ top: { type: 'array' } }) },
     timeoutMs: 120_000,
@@ -578,7 +887,7 @@ export function apply(ctx, config = {}) {
         detail: '只读取公开 API，不下载附件，不写除 ~/.dsh/jarvis/ 之外的任何路径。',
       });
       if (!g.allowed) return approvalPayload(g);
-      const r = await intel.run({ config: cfg, top: args.top ?? null, includeHf: args.includeHf !== false, timeoutMs: args.timeoutMs ?? 20000 });
+      const r = await intel.run({ config: cfg, top: args.top ?? null, includeHf: args.includeHf !== false, timeoutMs: args.timeoutMs ?? 20000, ifMissing: args.ifMissing === true });
       if (!r.ok) return { ok: false, needsApproval: false, networkNote: g.remind ?? '', ...r, message: r.message };
       return {
         ok: true,
@@ -586,6 +895,7 @@ export function apply(ctx, config = {}) {
         ...r,
         message:
           `今日情报已生成：${r.file}\n候选 ${r.counts.raw} 条 → 去重 ${r.counts.deduped} 条 → 精选 ${r.counts.picked} 条。` +
+          (r.sources?.length ? `\n源状态：${r.sources.map((s) => `${s.source}${s.ok ? `✅${s.count}` : '❌'}`).join(' / ')}` : '') +
           (r.notes?.length ? `\n注记：${r.notes.join('；')}` : '') +
           `\n\n${r.nextStep}`,
       };
@@ -617,6 +927,135 @@ export function apply(ctx, config = {}) {
           `周报骨架已生成：${r.file}\n倒计时：${cd}\n\n请**用真实内容填满它**（不许留空、不许写"这周很忙"），` +
           `填不出来的地方要明确写"缺数据"，然后向用户提问。填完用 jarvis_knowledge(action="add") 沉淀要点。`,
       };
+    }),
+  });
+
+  // -------------------------------------------------------------------------
+  // 10. jarvis_verify —— 引用核验（防幻觉的硬约束）
+  // -------------------------------------------------------------------------
+  register({
+    name: 'jarvis_verify',
+    description:
+      '引用核验：把一段文本里所有 `路径:行号` 与 URL 抽出来逐个核验（文件在不在、行号越界没、那一行到底写了什么），返回**每个引用的实际内容**。行号越界是确定性编造，一抓一个准；摘出原文则能让人一眼看出引用是否支持论点。写事实性回答之前或之后调用它，能让"编造"变成"当场被抓"。注意：只验「带行号」的引用；含空格的路径要用反引号包起来；相对路径要靠 roots 传根目录，否则只会去 Jarvis 数据目录下找。',
+    parameters: schema(
+      {
+        text: { type: 'string', description: '要核验的文本（通常是刚写好、准备发出的那段回答）' },
+        roots: {
+          type: 'array',
+          items: { type: 'string' },
+          description: '相对路径的解析根目录。**引用工作区里的文件时必须传**（例如当前工作区绝对路径），否则找不到会被判成 missing。',
+        },
+        checkUrls: {
+          type: 'boolean',
+          description: '是否联网核验 URL（每个链接一次 HEAD）。默认关；开了会走外网审批闸门（红线 R3）。',
+        },
+        max: { type: 'number', description: '最多核验多少条引用（默认 60）' },
+      },
+      ['text'],
+    ),
+    output: { schema: TEXT_OUT({ summary: { type: 'object' } }) },
+    timeoutMs: 90_000,
+    isConcurrencySafe: () => true,
+    execute: safe(async (args) => {
+      const text = String(args.text ?? '');
+      if (text.trim() === '') return { ok: false, message: '需要 text：把要核验的那段回答原样贴进来。' };
+
+      let fetcher = null;
+      let networkNote = '';
+      if (args.checkUrls === true) {
+        const cfg = cfgOrThrow();
+        const g = gate(cfg, {
+          action: 'network',
+          summary: `为核验链接是否失效，逐个访问外网（最多 12 个 URL，每个一次 HEAD）`,
+          detail: '只发 HEAD 请求，不下载任何内容，不写除 ~/.dsh/jarvis/ 之外的路径。',
+        });
+        if (!g.allowed) return approvalPayload(g);
+        networkNote = g.remind ?? '';
+        fetcher = async (url) => {
+          const ac = new AbortController();
+          const timer = setTimeout(() => ac.abort(), 8000);
+          try {
+            const res = await fetch(url, {
+              method: 'HEAD',
+              redirect: 'follow',
+              signal: ac.signal,
+              headers: { 'user-agent': 'dsh-jarvis-verify/0.1 (+local citation check)' },
+            });
+            return { status: res.status };
+          } catch (e) {
+            return { status: null, error: e?.name === 'AbortError' ? '超时（8s）' : e?.message ?? String(e) };
+          } finally {
+            clearTimeout(timer);
+          }
+        };
+      }
+
+      const r = await verifyCitations({ text, roots: args.roots ?? [], fetcher, max: args.max });
+      return {
+        ...r,
+        ...(networkNote ? { networkNote } : {}),
+        ...(fetcher ? {} : { urlNote: 'URL 未联网核验（checkUrls=false）。引用网页时要么开它，要么明确标"链接未验证"。' }),
+      };
+    }),
+  });
+
+  // -------------------------------------------------------------------------
+  // 11. jarvis_correction —— 纠错账本（幻觉统计）
+  // -------------------------------------------------------------------------
+  register({
+    name: 'jarvis_correction',
+    description:
+      '纠错账本：每当用户指出 Jarvis 说错了（"不对 / 不是这样 / 你编的 / 我查了不是这个"），立刻记一条——我原本的说法、正确说法、证据、类别、严重度。这是回答"幻觉什么时候发生、最容易发生在哪类事上"的**唯一可靠数据源**（幻觉本身无法自动统计）。action=record 记账；list 看最近条目；stats 出「最常出错类型」排行榜；drop 删错记的一条。写入只在 ~/.dsh/jarvis/ 内，无需审批。',
+    parameters: schema(
+      {
+        action: { type: 'string', enum: ['record', 'list', 'stats', 'drop'], description: '要做什么' },
+        claim: { type: 'string', description: 'record：我原本说错了什么（原话或忠实转述）' },
+        truth: { type: 'string', description: 'record：正确的说法是什么' },
+        evidence: { type: 'string', description: 'record：证据（文件路径:行号 / URL / 用户原话）' },
+        kind: {
+          type: 'string',
+          enum: [...claims.CLAIM_KINDS],
+          description: 'record：错在哪一类。path=路径行号 / api=API签名 / number=数字指标 / literature=文献作者年份 / date=日期 / fact=一般事实 / logic=推理 / other',
+        },
+        severity: { type: 'number', description: 'record：严重度 1=无害 2=会误导决策 3=会造成实际损失（默认 2）' },
+        id: { type: 'string', description: 'drop：要删除的记录 id' },
+        limit: { type: 'number', description: 'list：返回条数（默认 30）' },
+        days: { type: 'number', description: 'stats：只看最近 N 天（默认全部）' },
+      },
+      ['action'],
+    ),
+    output: { schema: TEXT_OUT({}) },
+    timeoutMs: 15_000,
+    isConcurrencySafe: () => false,
+    execute: safe(async (args) => {
+      const action = String(args.action ?? 'stats');
+      if (action === 'record') {
+        const rec = claims.record({
+          claim: args.claim,
+          truth: args.truth ?? '',
+          evidence: args.evidence ?? '',
+          kind: args.kind ?? 'fact',
+          severity: args.severity ?? 2,
+        });
+        const s = claims.stats();
+        return {
+          ok: true,
+          record: rec,
+          stats: s,
+          message: `已记账（${claims.CLAIM_LABELS[rec.kind] ?? rec.kind}｜严重度 ${rec.severity}）。${s.note}`,
+        };
+      }
+      if (action === 'list') {
+        const rows = claims.list({ limit: args.limit ?? 30 });
+        return { ok: true, count: rows.length, results: rows, message: rows.length === 0 ? '账本还是空的。' : `最近 ${rows.length} 条。` };
+      }
+      if (action === 'drop') {
+        if (!args.id) return { ok: false, message: 'drop 需要 id（先用 action="list" 看到 id）。' };
+        const r = claims.drop({ id: args.id });
+        return { ok: true, ...r, message: `已删除 ${r.removed} 条。` };
+      }
+      const s = claims.stats({ days: args.days ?? 0 });
+      return { ok: true, stats: s, message: s.note };
     }),
   });
 
@@ -748,14 +1187,15 @@ export function apply(ctx, config = {}) {
   // -------------------------------------------------------------------------
   try {
     const cfg = loadConfig();
-    const failed = registeredNames.length !== 9;
+    const missing = PLANNED_TOOLS.filter((n) => !registeredNames.includes(n));
     logLine(
-      `jarvis v0.1 ready; mode=${cfg.mode}; tools=${registeredNames.length}/9; commands=${registeredCommands.length}/5; names=${registeredNames.join(',')}${
-        failed ? '; WARNING=有工具没注册上（见上面的 warn 行）' : ''
+      `jarvis v0.3.0 ready; mode=${cfg.mode}; tools=${registeredNames.length}/${PLANNED_TOOLS.length}; commands=${registeredCommands.length}/5; names=${registeredNames.join(',')}${
+        missing.length ? `; MISSING=${missing.join(',')}（见上面的 warn 行）` : ''
       }`,
     );
     info(
-      `v0.1 ready — 模式 ${MODE_LABELS[cfg.mode] ?? cfg.mode}，${registeredNames.length} 个工具 + ${registeredCommands.length} 个命令 + 3 个技能，数据目录 ${paths.home}`,
+      `v0.3.0 ready — 模式 ${MODE_LABELS[cfg.mode] ?? cfg.mode}，${registeredNames.length} 个工具 + ${registeredCommands.length} 个命令 + 3 个技能，数据目录 ${paths.home}` +
+        (missing.length ? `；缺 ${missing.length} 个：${missing.join(',')}` : ''),
     );
   } catch (e) {
     warn(`启动横幅失败：${e?.message ?? e}`);
